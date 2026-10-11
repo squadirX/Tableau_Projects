@@ -11,11 +11,12 @@ Branch: `jobsearchagent/consolidated-upgrade-v1`
 ## Run on macOS
 ```bash
 cd "$HOME/JobSearchAgent"
-python3 -m py_compile job_agent.py
-python3 -m unittest discover -s "$HOME/Downloads" -p 'test_jobsearchagent_consolidated.py'
-python3 "$HOME/Downloads/jobsearchagent_consolidated.py" --audit
-python3 "$HOME/Downloads/jobsearchagent_consolidated.py" --normalize
-python3 "$HOME/Downloads/jobsearchagent_consolidated.py"
+# After copying the three companion files into this folder:
+python3 -m py_compile job_agent.py jobsearchagent_consolidated.py application_draft_builder.py
+python3 -m unittest test_jobsearchagent_consolidated
+python3 jobsearchagent_consolidated.py --audit
+python3 jobsearchagent_consolidated.py --normalize
+python3 jobsearchagent_consolidated.py
 ```
 
 Copy the companion script and test file from this repository's `JobSearchAgent/` folder into your local `~/JobSearchAgent/` folder before running. Keep the original `jobs.csv` and the verified backup. The normalized view is `data/jobs_normalized.csv`; malformed rows are excluded from that view, not guessed or discarded from the source.
