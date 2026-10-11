@@ -1397,81 +1397,75 @@ def analyze_job(
 
 def existing_urls():
 
+    """Return URLs only from structurally valid legacy rows.
+
+    The legacy file is never repaired or rewritten here. Rows with a
+    different width are ignored for deduplication and reported by the
+    companion audit tool.
+    """
     urls = set()
 
-    if not os.path.exists(
-        JOBS_FILE
-    ):
+    if not os.path.exists(JOBS_FILE):
         return urls
 
+    fields = [
+        "date", "source", "title", "company", "location",
+        "score", "decision", "matched_skills", "negative_matches", "url"
+    ]
+
     try:
-
-        with open(
-            JOBS_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            reader = csv.DictReader(
-                f
-            )
+        with open(JOBS_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            if header != fields:
+                log("WARNING: jobs.csv header differs from expected 10-column schema; deduplication skipped for safety.")
+                return urls
 
             for row in reader:
+                if len(row) != len(fields):
+                    continue
+                url = row[9].strip()
+                if url.startswith(("http://", "https://")):
+                    urls.add(url)
 
-                if row.get("url"):
-
-                    urls.add(
-                        row["url"]
-                    )
-
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"WARNING: Could not safely read existing job URLs: {e}")
 
     return urls
 
 
 def save_job(job):
 
-    os.makedirs(
-        DATA_DIR,
-        exist_ok=True
-    )
-
-    file_exists = os.path.exists(
-        JOBS_FILE
-    )
+    """Append one schema-checked legacy record; never rewrite existing rows."""
+    os.makedirs(DATA_DIR, exist_ok=True)
 
     fields = [
-        "date",
-        "source",
-        "title",
-        "company",
-        "location",
-        "score",
-        "decision",
-        "matched_skills",
-        "negative_matches",
-        "url"
+        "date", "source", "title", "company", "location",
+        "score", "decision", "matched_skills", "negative_matches", "url"
     ]
 
-    with open(
-        JOBS_FILE,
-        "a",
-        newline="",
-        encoding="utf-8"
-    ) as f:
+    if set(job.keys()) != set(fields):
+        missing = sorted(set(fields) - set(job.keys()))
+        extra = sorted(set(job.keys()) - set(fields))
+        raise ValueError(f"Refusing to write a non-schema job row. Missing={missing}; extra={extra}")
 
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fields
-        )
+    file_exists = os.path.exists(JOBS_FILE)
+    if file_exists:
+        # Fail closed if existing file header is unexpected. Do not append
+        # to a damaged/foreign schema and do not attempt automatic repair.
+        with open(JOBS_FILE, "r", encoding="utf-8-sig", newline="") as check:
+            header = next(csv.reader(check), [])
+        if header != fields:
+            raise RuntimeError(
+                "Refusing to append: jobs.csv header does not match the expected "
+                "10-column schema. Run the read-only audit first; source was not changed."
+            )
 
+    with open(JOBS_FILE, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="raise")
         if not file_exists:
             writer.writeheader()
-
-        writer.writerow(
-            job
-        )
+        writer.writerow(job)
 
 
 # ============================================================
