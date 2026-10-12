@@ -249,6 +249,9 @@ def score_job_details(job: dict, profile: dict | None = None) -> dict:
         status = "SKIP"
     elif not score_available:
         status = "INSUFFICIENT DATA"
+    elif not has_description or requirements_source != "entered from posting":
+        # High scores from snippets or inferred requirements must not look final.
+        status = "PROVISIONAL — VERIFY"
     elif score >= 70 and matched:
         status = "QUALIFIED — REVIEW"
     else:
