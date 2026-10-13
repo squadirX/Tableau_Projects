@@ -207,14 +207,13 @@ def _requirement_match(requirement: str, skill_texts: list[str], experience_text
 
 
 def score_job_details(job: dict, profile: dict | None = None) -> dict:
-    """Explainable requirement-to-evidence scoring. Not a hiring prediction."""
+    """Explainable evidence match; missing listing data is a warning, not a penalty."""
     searchable = " ".join(str(job.get(key, "")) for key in ("title", "company", "location", "description"))
     exclusions = [name for name, pattern in EXCLUSIONS.items() if re.search(pattern, searchable, re.I)]
     candidate = profile if isinstance(profile, dict) else load_candidate_profile()
     profile_skills = _as_list(candidate.get("verified_skills", []))
     profile_experience = _as_list(candidate.get("verified_experience", []))
-    # Keep support for the older job form: users may have recorded role-specific
-    # candidate skills in this field before the global profile editor existed.
+    # Keep support for role-specific evidence saved by older versions.
     role_skills = _as_list(job.get("verified_skills", []))
     candidate_skills = list(dict.fromkeys(profile_skills + role_skills))
     evidence_exists = bool(candidate_skills or profile_experience)
@@ -239,20 +238,20 @@ def score_job_details(job: dict, profile: dict | None = None) -> dict:
     has_description = bool(str(job.get("description", "")).strip()) and not bool(job.get("description_is_snippet", False))
     title = str(job.get("title", "")).lower()
     title_fit = any(term in title for term in TARGET_TERMS)
+    score_available = bool(requirements and evidence_exists)
     req_coverage = len(matched) / len(requirements) if requirements else 0.0
     experience_coverage = len(experience_matches) / len(requirements) if requirements else 0.0
-    # Weights: requirement evidence 55, experience evidence 20, role family 10,
-    # complete job description 15. Conservative caps prevent missing data from
-    # receiving a misleadingly high score.
-    score = round(req_coverage * 55 + experience_coverage * 20 + (10 if title_fit else 0) + (15 if has_description else 0))
-    if not evidence_exists:
-        score = min(score, 39)
-    if not has_description:
-        score = min(score, 49)
-    if not requirements:
-        score = min(score, 59)
+    # Match score is based on available requirement evidence only. Missing
+    # descriptions or unconfirmed requirements are shown as data-quality flags,
+    # not silently treated as evidence that the candidate is a poor match.
+    score = round(req_coverage * 80 + experience_coverage * 20) if score_available else 0
     if exclusions:
         status = "SKIP"
+    elif not score_available:
+        status = "INSUFFICIENT DATA"
+    elif not has_description or requirements_source != "entered from posting":
+        # High scores from snippets or inferred requirements must not look final.
+        status = "PROVISIONAL — VERIFY"
     elif score >= 70 and matched:
         status = "QUALIFIED — REVIEW"
     else:
@@ -260,6 +259,7 @@ def score_job_details(job: dict, profile: dict | None = None) -> dict:
 
     return {
         "score": max(0, min(100, score)),
+        "score_available": score_available,
         "status": status,
         "exclusions": exclusions,
         "requirements": requirements,
@@ -270,6 +270,7 @@ def score_job_details(job: dict, profile: dict | None = None) -> dict:
         "experience_matches": experience_matches,
         "has_candidate_evidence": evidence_exists,
         "has_description": has_description,
+        "title_fit": title_fit,
     }
 
 
@@ -325,19 +326,25 @@ def applications():
 def overview_page() -> str:
     job_records, app_records = jobs(), applications()
     candidate = load_candidate_profile()
-    qualified = sum(1 for item in job_records if (lambda result: result[0] >= 70 and not result[2])(score_job(item)))
+    qualified = sum(1 for item in job_records
+                    if score_job_details(item, candidate)["status"] == "QUALIFIED — REVIEW")
+    insufficient = sum(1 for item in job_records
+                       if score_job_details(item, candidate)["status"] == "INSUFFICIENT DATA")
     followups = sum(1 for item in app_records if item.get("status") in ("Follow-up due", "Interview"))
     body = '<h2>Overview</h2><p class="sub">Your search at a glance. Match scores use only the job details and verified evidence you enter.</p><div class="cards">'
-    body += metric("Jobs captured", len(job_records), "Manually entered and verified")
-    body += metric("Qualified for review", qualified, "Score ≥ 70; no detected exclusion")
+    body += metric("Jobs captured", len(job_records), "Existing records preserved")
+    body += metric("Qualified for review", qualified, "Same decision rule as Job Shortlist")
+    body += metric("Insufficient data", insufficient, "Add requirements and verified profile evidence")
     body += metric("Applications tracked", len(app_records), "No automatic submissions")
-    body += metric("Follow-up / interview", followups, "Items needing attention")
     body += '</div>'
     skills_value = escape(", ".join(candidate.get("verified_skills", [])))
     experience_value = escape("\n".join(candidate.get("verified_experience", [])))
+    profile_saved = bool(candidate.get("verified_skills") or candidate.get("verified_experience"))
+    profile_state = "Verified profile loaded" if profile_saved else "No verified profile evidence loaded in this dashboard session"
     body += (
         '<div class="panel"><h3>Your verified profile evidence</h3>'
-        '<p class="label">Enter only skills and experience supported by your real background. This is stored locally in data_v2/profile.json.</p>'
+        f'<p class="label">{escape(profile_state)} · Active data folder: {escape(str(DATA_DIR))} · Profile file: {escape(str(PROFILE_FILE))}</p>'
+        '<p class="label">Enter only skills and experience supported by your real background. Profile is stored locally in data_v2/profile.json. If this form is blank, check whether the dashboard is using the same data folder where you saved your profile.</p>'
         '<form method="post" action="/save-profile"><div class="formgrid">'
         f'<div class="wide"><label for="profile_skills">Confirmed skills (comma-separated)</label><input id="profile_skills" name="profile_skills" value="{skills_value}" placeholder="Excel, SQL, market research"></div>'
         f'<div class="wide"><label for="profile_experience">Verified experience evidence (one statement per line)</label><textarea id="profile_experience" name="profile_experience" placeholder="Prepared weekly Excel reports\nConducted customer research">{experience_value}</textarea></div>'
@@ -345,13 +352,51 @@ def overview_page() -> str:
         '</div>'
     )
     body += '<div class="panel"><h3>Next actions</h3><ol><li>Save your confirmed skills and experience in the profile section.</li><li>Add a job and enter its required skills from the posting.</li><li>Review matched evidence, gaps, and any detected exclusions.</li><li>Track only jobs you choose and prepare drafts for your own review.</li></ol></div>'
-    body += '<div class="warning"><b>Prototype note:</b> Scores compare entered job requirements with your verified skills and experience. Missing requirements, profile evidence, or job descriptions lower or cap the score. A score is not a hiring prediction.</div>'
+    body += '<div class="warning"><b>Scoring note:</b> A match score is shown only when both job requirements and verified candidate evidence are available. Missing descriptions or undetected requirements are flagged for review instead of being treated as evidence of a poor match. Scores are decision support, not a hiring prediction.</div>'
     return render_page("overview", body)
+
+
+def job_review_flags(job: dict, all_jobs: list[dict]) -> list[str]:
+    """Return non-destructive duplicate and freshness warnings for manual review."""
+    flags = []
+    title = _normalise_text(job.get("title", ""))
+    company = _normalise_text(job.get("company", ""))
+    source_url = str(job.get("source_url", "")).strip().rstrip("/").lower()
+    duplicates = []
+    for other in all_jobs:
+        if other is job:
+            continue
+        same_role = title and company and title == _normalise_text(other.get("title", "")) and company == _normalise_text(other.get("company", ""))
+        other_url = str(other.get("source_url", "")).strip().rstrip("/").lower()
+        same_url = source_url and other_url and source_url == other_url
+        if same_role or same_url:
+            duplicates.append(other)
+    if duplicates:
+        flags.append(f"Possible duplicate ({len(duplicates)} matching record(s))")
+
+    date_text = str(job.get("posting_date", "")).strip()
+    if not date_text:
+        flags.append("Posting date missing")
+    else:
+        try:
+            posted = datetime.strptime(date_text[:10], "%Y-%m-%d").date()
+            age_days = (datetime.now().date() - posted).days
+            if age_days > 45:
+                flags.append(f"Possibly stale ({age_days} days old)")
+            elif age_days < -1:
+                flags.append("Posting date is in the future — verify")
+        except ValueError:
+            flags.append("Posting date format unverified")
+    if not str(job.get("source_url", "")).strip().startswith(("https://", "http://")):
+        flags.append("Source URL missing")
+    if not str(job.get("description", "")).strip() or job.get("description_is_snippet", False):
+        flags.append("Full job description missing")
+    return flags
 
 
 def shortlist_page() -> str:
     records = jobs()
-    body = '<h2>Job Shortlist</h2><p class="sub">Start a new shortlist with jobs you have checked. For live imports, use <a href="/sources">Live Job Sources</a>. Enter required skills for the clearest match score; detected terms are labelled for review.</p><div class="panel"><h3>Add a job</h3><form method="post" action="/add-job"><div class="formgrid">'
+    body = '<h2>Job Shortlist</h2><p class="sub">Start a new shortlist with jobs you have checked. For live imports, use <a href="/sources">Live Job Sources</a>. Enter required skills for the clearest match score; detected terms are labelled for review. Duplicate and stale flags are warnings only; no saved job is deleted.</p><div class="panel"><h3>Add a job</h3><form method="post" action="/add-job"><div class="formgrid">'
     for key, label, kind in [("title", "Job title", "text"), ("company", "Company", "text"), ("location", "Location", "text"), ("source_url", "Source URL", "url"), ("posting_date", "Posting date (YYYY-MM-DD)", "text"), ("work_type", "Work type", "text")]:
         required = "required" if key in ("title", "company") else ""
         body += f'<div><label for="{key}">{label}</label><input id="{key}" name="{key}" type="{kind}" {required}></div>'
@@ -359,10 +404,12 @@ def shortlist_page() -> str:
     if not records:
         body += '<div class="empty">No jobs saved yet. Add a verified role above to populate this table.</div>'
     else:
-        body += '<div class="tablewrap"><table><thead><tr><th>Role / Company</th><th>Location</th><th>Score</th><th>Decision support</th><th>Evidence / gaps</th><th>Source</th></tr></thead><tbody>'
+        body += '<div class="tablewrap"><table><thead><tr><th>Role / Company</th><th>Location</th><th>Match score</th><th>Decision support</th><th>Evidence / data flags</th><th>Source</th></tr></thead><tbody>'
         for item in sorted(records, key=lambda row: row.get("created_at", ""), reverse=True):
             details = score_job_details(item)
             score, status, exclusions = details["score"], details["status"], details["exclusions"]
+            flags = job_review_flags(item, records)
+            score_label = f'{score}/100' if details["score_available"] else "N/A"
             source = f'<a href="{escape(item.get("source_url", ""), quote=True)}" target="_blank" rel="noopener">Open source</a>' if item.get("source_url", "").startswith(("https://", "http://")) else "Not supplied"
             exclusion_note = " · Exclusion: " + ", ".join(exclusions) if exclusions else ""
             evidence_lines = []
@@ -371,13 +418,14 @@ def shortlist_page() -> str:
             if details["gaps"]:
                 evidence_lines.append("Gaps: " + ", ".join(details["gaps"]))
             if not details["requirements"]:
-                evidence_lines.append("Requirements not supplied; score capped")
+                evidence_lines.append("Requirements not supplied")
             elif details["requirements_source"] != "entered from posting":
-                evidence_lines.append("Detected terms — confirm")
+                evidence_lines.append("Detected terms — confirm against source")
             if not details["has_candidate_evidence"]:
-                evidence_lines.append("Save verified profile first")
-            evidence_html = "<br>".join(escape(line) for line in evidence_lines) or "No matching evidence yet"
-            body += f'<tr><td><b>{escape(item.get("title", ""))}</b><br>{escape(item.get("company", ""))}<br><span class="label">{escape(item.get("posting_date", "") or "Posting date unknown")}</span></td><td>{escape(item.get("location", "Unknown"))}</td><td><span class="tag">{score}/100</span></td><td>{escape(status + exclusion_note)}</td><td>{evidence_html}</td><td>{source}</td></tr>'
+                evidence_lines.append("Verified profile evidence missing")
+            evidence_lines.extend(flags)
+            evidence_html = "<br>".join(escape(line) for line in evidence_lines) or "No review flags"
+            body += f'<tr><td><b>{escape(item.get("title", ""))}</b><br>{escape(item.get("company", ""))}<br><span class="label">{escape(item.get("posting_date", "") or "Posting date unknown")}</span></td><td>{escape(item.get("location", "Unknown"))}</td><td><span class="tag">{escape(score_label)}</span></td><td>{escape(status + exclusion_note)}</td><td>{evidence_html}</td><td>{source}</td></tr>'
         body += '</tbody></table></div>'
     body += '</div>'
     return render_page("shortlist", body)
@@ -436,14 +484,24 @@ def workspace_page() -> str:
 
 def reports_page() -> str:
     job_records, app_records = jobs(), applications()
-    bands = {"90–100 Excellent": 0, "80–89 Strong": 0, "70–79 Qualified": 0, "Below 70": 0, "Excluded": 0}
+    bands = {"90–100 Excellent": 0, "80–89 Strong": 0, "70–79 Qualified": 0,
+             "Below 70": 0, "Insufficient data": 0, "Excluded": 0}
+    candidate = load_candidate_profile()
     for item in job_records:
-        score, _, exclusions = score_job(item)
-        if exclusions: bands["Excluded"] += 1
-        elif score >= 90: bands["90–100 Excellent"] += 1
-        elif score >= 80: bands["80–89 Strong"] += 1
-        elif score >= 70: bands["70–79 Qualified"] += 1
-        else: bands["Below 70"] += 1
+        details = score_job_details(item, candidate)
+        score = details["score"]
+        if details["exclusions"]:
+            bands["Excluded"] += 1
+        elif not details["score_available"]:
+            bands["Insufficient data"] += 1
+        elif score >= 90:
+            bands["90–100 Excellent"] += 1
+        elif score >= 80:
+            bands["80–89 Strong"] += 1
+        elif score >= 70:
+            bands["70–79 Qualified"] += 1
+        else:
+            bands["Below 70"] += 1
     body = '<h2>Performance &amp; Reports</h2><p class="sub">Reports use only the new local records.</p><div class="panel"><h3>Job score distribution</h3><table><thead><tr><th>Band</th><th>Jobs</th><th>Share</th></tr></thead><tbody>'
     for label, count in bands.items():
         share = f"{count / len(job_records) * 100:.0f}%" if job_records else "—"
@@ -460,7 +518,7 @@ def reports_page() -> str:
         body += '</tbody></table>'
     else:
         body += '<div class="empty">Application metrics appear after you track applications.</div>'
-    body += '</div><div class="panel"><h3>Reporting notes</h3><ul><li>Response and interview rates will be shown only when outcome data is available.</li><li>Source comparisons need confirmed source information.</li><li>Skill-gap analysis can be added later using real job requirements and verified profile evidence.</li></ul></div>'
+    body += '</div><div class="panel"><h3>Reporting notes</h3><ul><li>Response and interview rates will be shown only when outcome data is available.</li><li>Source comparisons need confirmed source information.</li><li>Insufficient-data jobs are separated from low matches so missing listing information does not distort the match report.</li><li>Duplicate and stale listing flags are review-only; records are never removed automatically.</li></ul></div>'
     return render_page("reports", body)
 
 
