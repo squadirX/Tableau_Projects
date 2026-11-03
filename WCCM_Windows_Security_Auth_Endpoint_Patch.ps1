@@ -119,14 +119,19 @@ $Tokens = $null; $ParseErrors = $null
 if ($ParseErrors.Count -gt 0) { Remove-Item $TempPath -Force; throw "Parser rejected patch: $($ParseErrors[0].Message)" }
 $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
 Copy-Item -LiteralPath $AgentPath -Destination $BackupPath -ErrorAction Stop
-$WasRunning = (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue).State -eq "Running"
+$WasRunning = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State -eq "Running"
 if ($WasRunning) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop; Start-Sleep -Seconds 2 }
 try {
     Move-Item -LiteralPath $TempPath -Destination $AgentPath -Force
     Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     Start-Sleep -Seconds 3
-    $TaskState = (Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop).State
-    if ($TaskState -ne "Running") { throw "Agent task did not return to Running state: $TaskState" }
+    $TaskState = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State
+    $WaitUntil = (Get-Date).AddSeconds(15)
+    while ($TaskState -ne "Running" -and (Get-Date) -lt $WaitUntil) {
+        Start-Sleep -Milliseconds 500
+        $TaskState = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State
+    }
+    if ($TaskState -ne "Running") { throw "Agent task did not return to Running state after 15 seconds: $TaskState" }
 } catch {
     Copy-Item -LiteralPath $BackupPath -Destination $AgentPath -Force
     try { Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue } catch {}
