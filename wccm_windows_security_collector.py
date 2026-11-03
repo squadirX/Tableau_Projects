@@ -162,15 +162,8 @@ def main():
             log("poll=SKIPPED reason=collector_already_running")
             return 0
         try:
-            if args.once or args.replay:
-                once(replay=args.replay)
-            else:
-                while True:
-                    try:
-                        once()
-                    except Exception as exc:
-                        log("poll=ERROR reason=" + str(exc).replace("\n", " ")[:300])
-                    time.sleep(60)
+            # launchd invokes this short-lived process at RunAtLoad and every 60 seconds.
+            once(replay=args.replay)
         except Exception as exc:
             log("poll=ERROR reason=" + str(exc).replace("\n", " ")[:300])
             print("Collector test failed; see local log (no credentials are logged).", file=sys.stderr)
