@@ -54,7 +54,7 @@ function Get-WccmSecurityAuthEventsPayload {
             $Xml = [xml]$Record.ToXml()
             $Data = @{}
             foreach ($Item in @($Xml.Event.EventData.Data)) {
-                if ($null -ne $Item -and $Item.Name) { $Data[[string]$Item.Name] = [string]$Item.'#text' }
+                if ($null -ne $Item -and $Item.Name) { $Data[$Item.GetAttribute("Name")] = [string]$Item.InnerText }
             }
             $EventId = [int]$Record.Id
             $TimeUtc = ([DateTime]$Record.TimeCreated).ToUniversalTime().ToString("o")
