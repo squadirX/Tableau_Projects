@@ -46,9 +46,14 @@ function Get-WccmSecurityAuthEventsPayload {
                 return @{ status = 400; reason = "Bad Request"; body = @{ status = "ERROR"; error = "invalid_after_record_id" } }
             }
         }
-        $SinceText = $SinceUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ", [Globalization.CultureInfo]::InvariantCulture)
-        $XPath = "*[System[(EventID=4624 or EventID=4625) and EventRecordID > $AfterRecordId and TimeCreated[@SystemTime >= '$SinceText']]]"
+        # XPath 1.0 cannot reliably compare ISO-8601 date strings; establish a RecordID boundary first.
+        if ($AfterRecordId -eq 0) {
+            $Prior = Get-WinEvent -FilterHashtable @{ LogName = "Security"; ID = @(4624,4625); EndTime = $SinceUtc } -MaxEvents 1 -ErrorAction SilentlyContinue
+            if ($null -ne $Prior) { $AfterRecordId = [long]$Prior.RecordId }
+        }
+        $XPath = "*[System[(EventID=4624 or EventID=4625) and EventRecordID > $AfterRecordId]]"
         $Records = @(Get-WinEvent -LogName Security -FilterXPath $XPath -Oldest -MaxEvents 500 -ErrorAction Stop)
+        $Records = @($Records | Where-Object { $_.TimeCreated.ToUniversalTime() -ge $SinceUtc })
         $Events = @()
         foreach ($Record in $Records) {
             $Xml = [xml]$Record.ToXml()
