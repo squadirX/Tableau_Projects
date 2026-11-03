@@ -51,10 +51,13 @@ def load_state():
             "polls": int(obj.get("polls", 0)),
             "events_imported": int(obj.get("events_imported", 0)),
             "events_duplicate": int(obj.get("events_duplicate", 0)),
+            "last_batch_since_utc": obj.get("last_batch_since_utc"),
+            "last_batch_after_record_id": max(0, int(obj.get("last_batch_after_record_id", 0))),
         }
     except (OSError, ValueError, TypeError):
         return {"last_record_id": 0, "last_timestamp_utc": None, "last_successful_poll": None,
-                "polls": 0, "events_imported": 0, "events_duplicate": 0}
+                "polls": 0, "events_imported": 0, "events_duplicate": 0,
+                "last_batch_since_utc": None, "last_batch_after_record_id": 0}
 
 def save_state(state):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,10 +113,16 @@ def ingest_confirmed(result, count):
 def once(replay=False):
     host, port, token, config_path = load_config()
     state = load_state()
-    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds").replace("+00:00", "Z")
-    if state["last_timestamp_utc"] and not replay:
-        since = state["last_timestamp_utc"]
-    after_id = 0 if replay else state["last_record_id"]
+    if replay:
+        since = state.get("last_batch_since_utc")
+        if not since:
+            raise RuntimeError("No previously acknowledged batch is available for exact replay.")
+        after_id = state["last_batch_after_record_id"]
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        if state["last_timestamp_utc"]:
+            since = state["last_timestamp_utc"]
+        after_id = state["last_record_id"]
     query = urllib.parse.urlencode({"since_utc": since, "after_record_id": after_id})
     url = f"http://{host}:{port}/api/security/auth-events?{query}"
     status, payload = request_json(url, token=token)
@@ -141,6 +150,8 @@ def once(replay=False):
     newest = max(str(e.get("timestamp_utc") or e.get("timestamp")) for e in events)
     state["last_record_id"] = max(state["last_record_id"], max_id)
     state["last_timestamp_utc"] = newest
+    state["last_batch_since_utc"] = since
+    state["last_batch_after_record_id"] = after_id
     state["last_successful_poll"] = datetime.now(timezone.utc).isoformat()
     state["polls"] += 1
     state["events_imported"] += int(result.get("imported", result.get("result", {}).get("imported", 0)))
