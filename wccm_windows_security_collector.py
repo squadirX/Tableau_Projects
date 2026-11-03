@@ -15,6 +15,7 @@ STATE_FILE = STATE_DIR / "windows_security_collector_state.json"
 LOG_DIR = pathlib.Path.home() / "Library/Logs"
 LOG_FILE = LOG_DIR / "WCCM_Windows_Security_Collector.log"
 LOCK_FILE = STATE_DIR / "windows_security_collector.lock"
+BATCH_FILE = STATE_DIR / "windows_security_collector_last_batch.json"
 SIEM_URL = "http://127.0.0.1:18821/api/ingest"
 EXPECTED_DEVICE = "DESKTOP-8U2AFU4"
 EXPECTED_IDS = {4624, 4625}
@@ -116,21 +117,32 @@ def once(replay=False):
     if replay:
         since = state.get("last_batch_since_utc")
         if not since:
-            raise RuntimeError("No previously acknowledged batch is available for exact replay.")
+            raise RuntimeError("No previously acknowledged batch is available for replay.")
         after_id = state["last_batch_after_record_id"]
     else:
         since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds").replace("+00:00", "Z")
         if state["last_timestamp_utc"]:
             since = state["last_timestamp_utc"]
         after_id = state["last_record_id"]
-    query = urllib.parse.urlencode({"since_utc": since, "after_record_id": after_id})
-    url = f"http://{host}:{port}/api/security/auth-events?{query}"
-    status, payload = request_json(url, token=token)
-    if status != 200 or payload.get("status") != "OK" or not isinstance(payload.get("events"), list):
-        raise RuntimeError("Windows Agent returned an unexpected event response.")
-    events = [e for e in payload["events"] if isinstance(e, dict) and validate_event(e)]
-    if len(events) != len(payload["events"]):
-        raise RuntimeError("Strict event validation rejected one or more records; checkpoint not advanced.")
+
+    if replay and BATCH_FILE.exists():
+        events = json.loads(BATCH_FILE.read_text(encoding="utf-8"))
+        if not isinstance(events, list) or not events or any(not isinstance(e, dict) or not validate_event(e) for e in events):
+            raise RuntimeError("Saved replay batch is invalid; no ingest attempted.")
+    else:
+        query = urllib.parse.urlencode({"since_utc": since, "after_record_id": after_id})
+        url = f"http://{host}:{port}/api/security/auth-events?{query}"
+        status, payload = request_json(url, token=token)
+        if status != 200 or payload.get("status") != "OK" or not isinstance(payload.get("events"), list):
+            raise RuntimeError("Windows Agent returned an unexpected event response.")
+        events = [e for e in payload["events"] if isinstance(e, dict) and validate_event(e)]
+        if len(events) != len(payload["events"]):
+            raise RuntimeError("Strict event validation rejected one or more records; checkpoint not advanced.")
+        if replay:
+            # Legacy checkpoint migration: reconstruct only the previously acknowledged record-ID range.
+            events = [e for e in events if after_id < int(e["record_id"]) <= state["last_record_id"]]
+            if not events or max(int(e["record_id"]) for e in events) != state["last_record_id"]:
+                raise RuntimeError("Could not reconstruct the exact prior batch from its acknowledged record-ID boundary.")
     if not events:
         state["last_successful_poll"] = datetime.now(timezone.utc).isoformat()
         state["polls"] += 1
@@ -144,10 +156,23 @@ def once(replay=False):
     if status != 200 or not ingest_confirmed(result, len(events)):
         raise RuntimeError("SIEM ingest acknowledgement did not confirm imported + duplicates = batch and skipped = 0; checkpoint not advanced.")
     if replay:
+        if not BATCH_FILE.exists():
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_batch = BATCH_FILE.with_suffix(".tmp")
+            tmp_batch.write_text(json.dumps(events, separators=(",", ":")) + "\n", encoding="utf-8")
+            os.chmod(tmp_batch, 0o600)
+            os.replace(tmp_batch, BATCH_FILE)
+            os.chmod(BATCH_FILE, 0o600)
         log(f"replay=OK events={len(events)} siem_ack=confirmed checkpoint_unchanged=1")
         return
     max_id = max(int(e["record_id"]) for e in events)
     newest = max(str(e.get("timestamp_utc") or e.get("timestamp")) for e in events)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_batch = BATCH_FILE.with_suffix(".tmp")
+    tmp_batch.write_text(json.dumps(events, separators=(",", ":")) + "\n", encoding="utf-8")
+    os.chmod(tmp_batch, 0o600)
+    os.replace(tmp_batch, BATCH_FILE)
+    os.chmod(BATCH_FILE, 0o600)
     state["last_record_id"] = max(state["last_record_id"], max_id)
     state["last_timestamp_utc"] = newest
     state["last_batch_since_utc"] = since
@@ -162,7 +187,7 @@ def once(replay=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--replay", action="store_true", help="Re-fetch and repost the current 24h batch without advancing checkpoint.")
+    parser.add_argument("--replay", action="store_true", help="Replay the exact saved batch without advancing checkpoint.")
     args = parser.parse_args()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(STATE_DIR, 0o700)
